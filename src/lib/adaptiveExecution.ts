@@ -334,8 +334,14 @@ export function discoverFallbackMethods(
     }
   }
 
+  // Filter against capability availability in current environment
+  const availableCandidates = candidates.filter((cand) => {
+    const status = systemCapabilityRegistry.checkAvailability(cand.capabilityId);
+    return status.isAvailable;
+  });
+
   // Filter against user-specified allowed/disallowed methods
-  return candidates.filter((cand) => {
+  return availableCandidates.filter((cand) => {
     if (policy.disallowedMethods && policy.disallowedMethods.includes(cand.methodId)) {
       return false;
     }
@@ -533,6 +539,88 @@ export function executeAdaptiveObjectiveSync(
       startedAt,
       verified: false,
     };
+
+    // 0. Capability Availability & Environment Awareness Pre-Check
+    const capStatus = systemCapabilityRegistry.checkAvailability(currentMethod.capabilityId);
+    if (!capStatus.isAvailable) {
+      attempt.completedAt = Date.now();
+      attempt.durationMs = 0;
+      attempt.status = 'failed';
+      attempt.verified = false;
+      if (capStatus.state === 'network_required') {
+        attempt.failureCategory = 'network_unavailable';
+      } else if (capStatus.state === 'permission_denied' || capStatus.state === 'permission_required') {
+        attempt.failureCategory = 'permission_denied';
+      } else if (capStatus.state === 'resource_constrained') {
+        attempt.failureCategory = 'resource_constraint';
+      } else if (capStatus.state === 'unsupported_platform') {
+        attempt.failureCategory = 'unsupported_operation';
+      } else {
+        attempt.failureCategory = 'unavailable_capability';
+      }
+      attempt.failureReason =
+        capStatus.reason?.userFriendlyReason ||
+        capStatus.reason?.message ||
+        `Capability "${currentMethod.capabilityId}" is unavailable in this environment.`;
+      attempt.error = {
+        message: capStatus.reason?.message || 'Capability unavailable',
+        code: capStatus.reason?.code,
+      };
+      recordAttempt(attempt);
+      attempts.push(attempt);
+
+      if (policy.exclusivity === 'exclusive' || !policy.allowAutonomousFallback) {
+        break;
+      }
+
+      const fallbacks = discoverFallbackMethods(
+        objective,
+        currentMethod.target,
+        attempt,
+        attempts,
+        policy,
+        context
+      );
+
+      if (fallbacks.length === 0) {
+        break;
+      }
+
+      const nextCandidate = fallbacks[0];
+      if (nextCandidate.requiresConfirmation || policy.requireConfirmationOnAlternative) {
+        const pausedResult: AdaptiveExecutionResult = {
+          objective,
+          preferredMethod: preferredMethod.methodName,
+          status: 'requires_confirmation',
+          attempts,
+          response: `The requested method **${preferredMethod.methodName}** is unavailable in this environment (${attempt.failureReason}). A valid alternative (**${nextCandidate.methodName}**) is available, but requires confirmation before proceeding.`,
+          isVerified: false,
+          adapted: false,
+          actions: [
+            {
+              label: `Proceed with ${nextCandidate.methodName}`,
+              actionText: `run ${nextCandidate.intent} ${nextCandidate.target || ''}`.trim(),
+              description: nextCandidate.description,
+              variant: 'default',
+            },
+          ],
+        };
+        setLatestAdaptiveResult(pausedResult);
+        return pausedResult;
+      }
+
+      currentMethod = {
+        capabilityId: nextCandidate.capabilityId,
+        methodId: nextCandidate.methodId,
+        methodName: nextCandidate.methodName,
+        intent: nextCandidate.intent,
+        target: nextCandidate.target,
+        parameters: nextCandidate.parameters,
+        isPreferred: false,
+      };
+      attemptIdx++;
+      continue;
+    }
 
     // Execute through registered system capability or direct route
     let execSuccess = false;

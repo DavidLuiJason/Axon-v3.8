@@ -499,6 +499,21 @@ export function evaluateChatCommand(
   }
 
   // -------------------------------------------------------------
+  // 0.75. Capability Availability & Environment Self-Awareness Queries
+  // (Truthfully reports offline capabilities, active availability, and reasons for unavailability)
+  // -------------------------------------------------------------
+  const capabilityAwarenessAnswer = systemCapabilityRegistry.querySelfAwareness(trimmed);
+  if (capabilityAwarenessAnswer) {
+    return {
+      handled: true,
+      executed: false,
+      response: capabilityAwarenessAnswer,
+      purpose: 'provide_information',
+      statementType: 'question',
+    };
+  }
+
+  // -------------------------------------------------------------
   // 0.8. Action Plan / Execution Plan Resolution
   // (Multi-step sequential, parallel, queued, conditional, retry, adaptive policy, and priority plans)
   // -------------------------------------------------------------

@@ -5,6 +5,34 @@ import {
   InterfaceMetadata,
 } from './interfaceRegistry';
 import { tryEvaluateMathExpression } from './storageChatHandler';
+import { fileIntelligence } from './fileIntelligence';
+import {
+  CapabilityRequirements,
+  CapabilitySelfDescription,
+  CapabilityAvailabilityState,
+  CapabilityAvailabilityStatus,
+  UnavailabilityReason,
+  EnvironmentSnapshot,
+  CapabilityAvailabilityCheckOptions,
+  environmentAwareness,
+  evaluateCapabilityAvailability,
+  queryCapabilitySelfAwareness,
+} from './capabilityAvailability';
+
+export type {
+  CapabilityRequirements,
+  CapabilitySelfDescription,
+  CapabilityAvailabilityState,
+  CapabilityAvailabilityStatus,
+  UnavailabilityReason,
+  EnvironmentSnapshot,
+  CapabilityAvailabilityCheckOptions,
+};
+export {
+  environmentAwareness,
+  evaluateCapabilityAvailability,
+  queryCapabilitySelfAwareness,
+};
 
 // ============================================================================
 // 1. STATEMENT CLASSIFICATION & INTENT TYPES
@@ -200,6 +228,9 @@ export interface SystemCapability {
   id: string;
   name: string;
   description: string;
+  requirements?: CapabilityRequirements;
+  selfDescription?: CapabilitySelfDescription;
+  checkAvailability?: (env: EnvironmentSnapshot) => CapabilityAvailabilityStatus | null;
   intents: CapabilityActionDefinition[];
   canHandleDirectly?: (intent: string, target?: string, params?: Record<string, any>) => boolean;
   resolveAlternative?: (objective: string, requestedMethod?: string) => AlternativeResolution | null;
@@ -236,6 +267,73 @@ class SystemCapabilityRegistry {
 
   public getAll(): SystemCapability[] {
     return Array.from(this.capabilities.values());
+  }
+
+  /**
+   * Evaluates dynamic runtime availability of a capability in the current environment.
+   */
+  public checkAvailability(
+    capabilityId: string,
+    options?: CapabilityAvailabilityCheckOptions
+  ): CapabilityAvailabilityStatus {
+    const cap = this.get(capabilityId);
+    if (!cap) {
+      return {
+        capabilityId,
+        capabilityName: capabilityId,
+        isAvailable: false,
+        state: 'unavailable',
+        reason: {
+          state: 'unavailable',
+          code: 'CAPABILITY_NOT_FOUND',
+          message: `Capability "${capabilityId}" is not registered in AXON.`,
+          userFriendlyReason: `AXON does not support a "${capabilityId}" capability.`,
+          missingRequirement: { type: 'dependency', target: capabilityId },
+        },
+        canOperateOffline: false,
+        dynamicChangeSupported: false,
+        checkedAt: Date.now(),
+      };
+    }
+    return evaluateCapabilityAvailability(cap, options);
+  }
+
+  /**
+   * Filters and returns all capabilities that are currently usable in this environment.
+   */
+  public getAvailableCapabilities(
+    options?: CapabilityAvailabilityCheckOptions & { offlineOnly?: boolean }
+  ): SystemCapability[] {
+    const env = environmentAwareness.getSnapshot();
+    return this.getAll().filter((cap) => {
+      if (options?.offlineOnly && cap.requirements && !cap.requirements.offlineCapable) {
+        return false;
+      }
+      const status = evaluateCapabilityAvailability(cap, {
+        activeAccounts: options?.activeAccounts,
+        customEnvironment: env,
+      });
+      return status.isAvailable;
+    });
+  }
+
+  /**
+   * Obtains a complete instantaneous environmental snapshot.
+   */
+  public getEnvironmentSnapshot(): EnvironmentSnapshot {
+    return environmentAwareness.getSnapshot(
+      this.getAll().map((c) => ({ id: c.id, requirements: c.requirements }))
+    );
+  }
+
+  /**
+   * Queries self-awareness for truthful capability status and limits.
+   */
+  public querySelfAwareness(query: string, activeAccounts?: any[]): string | null {
+    return queryCapabilitySelfAwareness(query, {
+      capabilities: this.getAll(),
+      activeAccounts,
+    });
   }
 
   /**
@@ -328,6 +426,22 @@ class SystemCapabilityRegistry {
       id: 'workspace_navigation',
       name: 'Workspace Navigation',
       description: 'Navigates and opens registered interfaces, views, and tool suites.',
+      requirements: {
+        offlineCapable: true,
+        requiresNetwork: false,
+        supportedPlatforms: ['all'],
+      },
+      selfDescription: {
+        whatItDoes: 'Navigates and transitions between registered interfaces and tool suites.',
+        whatItRequires: 'Destination interface screen or target name',
+        whenAvailable: 'Always available offline in all environments.',
+        whatMakesItUnavailable: 'Missing navigation context in runtime.',
+        canRunOffline: true,
+        hasKnownAlternatives: true,
+        hasSideEffects: false,
+        requiresConfirmation: false,
+        resultType: 'Interface view transition',
+      },
       intents: [
         {
           intent: 'open',
@@ -376,6 +490,22 @@ class SystemCapabilityRegistry {
       id: 'settings_controller',
       name: 'Settings & Appearance Controller',
       description: 'Controls theme mode, accent colors, icon presets, sound effects, and notifications.',
+      requirements: {
+        offlineCapable: true,
+        requiresNetwork: false,
+        supportedPlatforms: ['all'],
+      },
+      selfDescription: {
+        whatItDoes: 'Controls theme mode, accent colors, and appearance preferences.',
+        whatItRequires: 'Settings handlers in execution context',
+        whenAvailable: 'Always available offline in all environments.',
+        whatMakesItUnavailable: 'Missing settings handlers in context.',
+        canRunOffline: true,
+        hasKnownAlternatives: true,
+        hasSideEffects: false,
+        requiresConfirmation: false,
+        resultType: 'Appearance preference update',
+      },
       intents: [
         {
           intent: 'set_theme',
@@ -532,6 +662,23 @@ class SystemCapabilityRegistry {
       id: 'interface_capture',
       name: 'Interface Capture & Document Generation',
       description: 'Captures visual layout states, analyzes layout segments, and generates PDF export bundles.',
+      requirements: {
+        offlineCapable: true,
+        requiresNetwork: false,
+        supportedPlatforms: ['browser', 'pwa', 'iframe'],
+        requiredDependencies: ['dom'],
+      },
+      selfDescription: {
+        whatItDoes: 'Captures visual layout states and generates compiled PDF bundles.',
+        whatItRequires: 'Browser DOM environment',
+        whenAvailable: 'Available in browser, PWA, and iframe environments.',
+        whatMakesItUnavailable: 'Headless or non-DOM environments.',
+        canRunOffline: true,
+        hasKnownAlternatives: true,
+        hasSideEffects: false,
+        requiresConfirmation: false,
+        resultType: 'Exported PDF document',
+      },
       intents: [
         {
           intent: 'capture_interface',
@@ -608,6 +755,23 @@ class SystemCapabilityRegistry {
       id: 'storage_diagnostics',
       name: 'Storage & Memory Diagnostics',
       description: 'Monitors asset quota, clears asset cache, and reallocates storage capacity.',
+      requirements: {
+        offlineCapable: true,
+        requiresNetwork: false,
+        supportedPlatforms: ['all'],
+        requiredDependencies: ['storage'],
+      },
+      selfDescription: {
+        whatItDoes: 'Monitors asset quota, inspects memory allocations, and reallocates storage.',
+        whatItRequires: 'Local storage access',
+        whenAvailable: 'Always available offline in all environments.',
+        whatMakesItUnavailable: 'Storage quota disabled or completely exhausted.',
+        canRunOffline: true,
+        hasKnownAlternatives: true,
+        hasSideEffects: false,
+        requiresConfirmation: false,
+        resultType: 'Storage quota diagnostic manifest',
+      },
       intents: [
         {
           intent: 'inspect_storage',
@@ -676,6 +840,22 @@ class SystemCapabilityRegistry {
       id: 'math_calculator',
       name: 'Offline Math Engine',
       description: 'Evaluates arithmetic expressions, percentages, and scientific calculations offline.',
+      requirements: {
+        offlineCapable: true,
+        requiresNetwork: false,
+        supportedPlatforms: ['all'],
+      },
+      selfDescription: {
+        whatItDoes: 'Evaluates arithmetic, percentage, and scientific expressions offline.',
+        whatItRequires: 'Mathematical expression string',
+        whenAvailable: 'Always available offline with zero latency.',
+        whatMakesItUnavailable: 'Malformed or indeterminate expression.',
+        canRunOffline: true,
+        hasKnownAlternatives: true,
+        hasSideEffects: false,
+        requiresConfirmation: false,
+        resultType: 'Computed numerical value',
+      },
       intents: [
         {
           intent: 'calculate',
@@ -709,6 +889,22 @@ class SystemCapabilityRegistry {
       id: 'automation_runner',
       name: 'Automation & Extension Runner',
       description: 'Executes user-defined automation rules, run code scripts, and custom slash commands.',
+      requirements: {
+        offlineCapable: true,
+        requiresNetwork: false,
+        supportedPlatforms: ['all'],
+      },
+      selfDescription: {
+        whatItDoes: 'Executes user-defined automation rules, scripts, and custom slash commands.',
+        whatItRequires: 'Registered script or command name',
+        whenAvailable: 'Always available offline in all environments.',
+        whatMakesItUnavailable: 'Unregistered command identifier.',
+        canRunOffline: true,
+        hasKnownAlternatives: true,
+        hasSideEffects: false,
+        requiresConfirmation: false,
+        resultType: 'Script execution outcome',
+      },
       intents: [
         {
           intent: 'run_custom_command',
@@ -722,6 +918,173 @@ class SystemCapabilityRegistry {
           executed: true,
           purpose: 'report_result',
           response: `Automation instruction "${target || intent}" processed.`,
+        };
+      },
+    });
+
+    // 7. Local File Intelligence & Search (Offline-Capable)
+    this.register({
+      id: 'file_intelligence',
+      name: 'Local File Intelligence',
+      description: 'Searches locally indexed documents, notes, code files, and scripture concordance offline.',
+      requirements: {
+        offlineCapable: true,
+        requiresNetwork: false,
+        supportedPlatforms: ['all'],
+      },
+      selfDescription: {
+        whatItDoes: 'Performs multi-hook search across locally indexed workspace files and notes.',
+        whatItRequires: 'Search query string',
+        whenAvailable: 'Always available offline in all environments.',
+        whatMakesItUnavailable: 'Empty search query.',
+        canRunOffline: true,
+        hasKnownAlternatives: true,
+        hasSideEffects: false,
+        requiresConfirmation: false,
+        resultType: 'Matching indexed files and excerpts',
+      },
+      intents: [
+        {
+          intent: 'search_files',
+          description: 'Searches local indexed workspace documents and notes.',
+          supportedPolicies: ['immediate'],
+        },
+      ],
+      execute: async (intent, target, params) => {
+        const query = params?.query || target || '';
+        const results = await fileIntelligence.search({ naturalLanguageQuery: query });
+        const summary = fileIntelligence.formatSearchResultsForResponse(query, results);
+        return {
+          success: true,
+          executed: true,
+          purpose: 'report_result',
+          response: summary,
+          metadata: { resultCount: results.length, results },
+        };
+      },
+    });
+
+    // 8. Web Research Service (Online Required)
+    this.register({
+      id: 'web_research_service',
+      name: 'Web Research Service',
+      description: 'Queries remote online sources for live internet information and external documentation.',
+      requirements: {
+        requiresNetwork: true,
+        offlineCapable: false,
+        supportedPlatforms: ['all'],
+      },
+      selfDescription: {
+        whatItDoes: 'Queries remote online sources for live web information.',
+        whatItRequires: 'Active internet connectivity',
+        whenAvailable: 'When the network connection is online.',
+        whatMakesItUnavailable: 'Device is offline or remote endpoints are unreachable.',
+        canRunOffline: false,
+        hasKnownAlternatives: true,
+        hasSideEffects: false,
+        requiresConfirmation: false,
+        resultType: 'Online web search findings',
+      },
+      intents: [
+        {
+          intent: 'research_web',
+          description: 'Searches remote web sources for information.',
+          supportedPolicies: ['immediate'],
+        },
+      ],
+      resolveAlternative: (objective, requestedMethod) => {
+        // If device is offline, adapt to local indexed information
+        if (!environmentAwareness.isNetworkOnline()) {
+          return {
+            objective,
+            requestedMethod,
+            routeType: 'alternative',
+            targetCapabilityId: 'file_intelligence',
+            explanation:
+              'Online web research is unavailable because the network connection is offline. AXON can search locally indexed documents and workspace notes instead.',
+            actions: [
+              {
+                label: 'Search Local Files',
+                actionText: `search for "${objective}" in local files`,
+                intent: 'search_files',
+                variant: 'default',
+              },
+            ],
+          };
+        }
+        return null;
+      },
+      execute: (intent, target) => {
+        if (!environmentAwareness.isNetworkOnline()) {
+          return {
+            success: false,
+            executed: false,
+            purpose: 'explain_limitation',
+            response: 'Web research is unavailable because the device is offline.',
+          };
+        }
+        return {
+          success: true,
+          executed: true,
+          purpose: 'report_result',
+          response: `Online research query "${target || intent}" processed.`,
+        };
+      },
+    });
+
+    // 9. Remote Cloud AI Service (Online & Configured API Key Required)
+    this.register({
+      id: 'remote_ai_service',
+      name: 'Remote Cloud AI Service',
+      description: 'Delegates complex reasoning or multimodal tasks to remote cloud models (Google Gemini, Anthropic Claude, OpenAI).',
+      requirements: {
+        requiresNetwork: true,
+        offlineCapable: false,
+        requiresExternalAccount: 'gemini',
+        supportedPlatforms: ['all'],
+      },
+      selfDescription: {
+        whatItDoes: 'Delegates tasks to remote cloud AI models.',
+        whatItRequires: 'Active internet connection and configured API key in Settings',
+        whenAvailable: 'When online with a configured API key.',
+        whatMakesItUnavailable: 'Device is offline, API key missing, or account in cooldown.',
+        canRunOffline: false,
+        hasKnownAlternatives: true,
+        hasSideEffects: true,
+        requiresConfirmation: false,
+        resultType: 'Cloud AI response',
+      },
+      intents: [
+        {
+          intent: 'generate_remote_ai',
+          description: 'Generates responses using remote cloud models.',
+          supportedPolicies: ['immediate'],
+        },
+      ],
+      resolveAlternative: (objective, requestedMethod) => {
+        return {
+          objective,
+          requestedMethod,
+          routeType: 'alternative',
+          targetCapabilityId: 'math_calculator',
+          explanation:
+            'Remote cloud AI is unavailable. AXON Neural Engine operates on-device without external API limits.',
+        };
+      },
+      execute: (intent, target) => {
+        if (!environmentAwareness.isNetworkOnline()) {
+          return {
+            success: false,
+            executed: false,
+            purpose: 'explain_limitation',
+            response: 'Remote AI service is unavailable because the device is offline.',
+          };
+        }
+        return {
+          success: true,
+          executed: true,
+          purpose: 'report_result',
+          response: `Remote AI operation completed for "${target || intent}".`,
         };
       },
     });
