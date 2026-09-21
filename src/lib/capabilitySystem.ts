@@ -82,6 +82,14 @@ export type {
   PlanExecutionResult,
 } from './actionPlan';
 
+export type {
+  FailureCategory,
+  MethodExclusivity,
+  ExecutionAttempt,
+  AdaptiveFallbackPolicy,
+  AdaptiveExecutionResult,
+} from './actionPlan';
+
 export {
   createSingleActionPlan,
   createSequentialPlan,
@@ -99,6 +107,15 @@ export {
   executeActionPlanSync,
   executeActionPlan,
   resolveActionPlanFromInput,
+  executeAdaptiveObjectiveSync,
+  queryAttemptHistory,
+  getGlobalAttemptHistory,
+  getLatestAdaptiveResult,
+  clearAttemptHistory,
+  recordAttempt,
+  generateAdaptiveReport,
+  discoverFallbackMethods,
+  verifyAttemptResult,
 } from './actionPlan';
 
 import type { ActionExecutionPlan } from './actionPlan';

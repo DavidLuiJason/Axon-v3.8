@@ -353,4 +353,6 @@ console.log('====================================================');
 
 if (!allPassed) {
   process.exit(1);
+} else {
+  process.exit(0);
 }

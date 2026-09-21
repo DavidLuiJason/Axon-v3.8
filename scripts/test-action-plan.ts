@@ -387,6 +387,7 @@ console.log('\n====================================================');
 console.log(`TOTAL TESTS: ${passed + failed} | PASSED: ${passed} | FAILED: ${failed}`);
 if (failed === 0) {
   console.log('SUCCESS: All Action Plan architecture tests passed flawlessly!\n');
+  process.exit(0);
 } else {
   console.error(`FAILURE: ${failed} tests failed!\n`);
   process.exit(1);

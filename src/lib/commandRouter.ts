@@ -39,6 +39,7 @@ import {
   CapabilityActionDefinition,
   resolveActionPlanFromInput,
   executeActionPlanSync,
+  queryAttemptHistory,
 } from './capabilitySystem';
 
 export interface CommandRouterActions {
@@ -483,8 +484,23 @@ export function evaluateChatCommand(
   }
 
   // -------------------------------------------------------------
+  // 0.7. Follow-up Attempt History Queries
+  // (Answers "what did you try?", "why didn't method X work?", "which method succeeded?", etc.)
+  // -------------------------------------------------------------
+  const attemptHistoryAnswer = queryAttemptHistory(trimmed);
+  if (attemptHistoryAnswer) {
+    return {
+      handled: true,
+      executed: false,
+      response: attemptHistoryAnswer,
+      purpose: 'report_result',
+      statementType: 'question',
+    };
+  }
+
+  // -------------------------------------------------------------
   // 0.8. Action Plan / Execution Plan Resolution
-  // (Multi-step sequential, parallel, queued, conditional, retry, and priority plans)
+  // (Multi-step sequential, parallel, queued, conditional, retry, adaptive policy, and priority plans)
   // -------------------------------------------------------------
   const multiPlan = resolveActionPlanFromInput(trimmed, currentScreen);
   if (
@@ -492,6 +508,7 @@ export function evaluateChatCommand(
     (multiPlan.actions.length > 1 ||
       multiPlan.type === 'queue' ||
       multiPlan.status === 'cancelled' ||
+      Boolean(multiPlan.adaptivePolicy) ||
       /^(?:try\s+it\s+again|try\s+again|retry)/i.test(trimmed) ||
       trimmed.toLowerCase().includes('high priority') ||
       trimmed.toLowerCase().includes('run next') ||

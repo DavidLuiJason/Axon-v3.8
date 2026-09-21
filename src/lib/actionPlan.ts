@@ -42,6 +42,44 @@ import {
 } from './capabilitySystem';
 import { resolveInterfaceFromQuery } from './interfaceRegistry';
 import { tryEvaluateMathExpression } from './storageChatHandler';
+import type {
+  FailureCategory,
+  MethodExclusivity,
+  ExecutionAttempt,
+  AdaptiveFallbackPolicy,
+  AdaptiveExecutionResult,
+} from './adaptiveExecution';
+import {
+  executeAdaptiveObjectiveSync,
+  queryAttemptHistory,
+  getGlobalAttemptHistory,
+  getLatestAdaptiveResult,
+  clearAttemptHistory,
+  recordAttempt,
+  generateAdaptiveReport,
+  discoverFallbackMethods,
+  verifyAttemptResult,
+} from './adaptiveExecution';
+
+export type {
+  FailureCategory,
+  MethodExclusivity,
+  ExecutionAttempt,
+  AdaptiveFallbackPolicy,
+  AdaptiveExecutionResult,
+};
+
+export {
+  executeAdaptiveObjectiveSync,
+  queryAttemptHistory,
+  getGlobalAttemptHistory,
+  getLatestAdaptiveResult,
+  clearAttemptHistory,
+  recordAttempt,
+  generateAdaptiveReport,
+  discoverFallbackMethods,
+  verifyAttemptResult,
+};
 
 // ============================================================================
 // 1. ACTION PLAN TYPES & ABSTRACTIONS
@@ -95,6 +133,8 @@ export interface ActionNode {
   };
   startedAt?: number;
   completedAt?: number;
+  attempts?: ExecutionAttempt[];
+  fallbackPolicy?: AdaptiveFallbackPolicy;
 }
 
 export interface ActionExecutionPlan {
@@ -113,6 +153,8 @@ export interface ActionExecutionPlan {
   startedAt?: number;
   completedAt?: number;
   cancellationToken?: { isCancelled: boolean; reason?: string };
+  attempts?: ExecutionAttempt[];
+  adaptivePolicy?: AdaptiveFallbackPolicy;
 }
 
 export interface PlanExecutionResult {
@@ -128,6 +170,8 @@ export interface PlanExecutionResult {
   plan: ActionExecutionPlan;
   targetScreen?: ScreenId;
   actions?: ContextualMessageAction[];
+  attempts?: ExecutionAttempt[];
+  adapted?: boolean;
 }
 
 // ============================================================================
@@ -516,9 +560,63 @@ export function executeActionNodeDirect(
   error?: { message: string; code?: string };
   response?: string;
   targetScreen?: ScreenId;
+  attempts?: ExecutionAttempt[];
 } {
+  if (action.fallbackPolicy) {
+    const adaptiveRes = executeAdaptiveObjectiveSync(
+      action.description,
+      {
+        capabilityId: action.capabilityId,
+        methodId: action.intent || action.capabilityId,
+        methodName: action.description || action.capabilityId,
+        intent: action.intent,
+        target: action.target,
+        parameters: action.parameters,
+      },
+      action.fallbackPolicy,
+      context
+    );
+    action.attempts = adaptiveRes.attempts;
+    action.completedAt = Date.now();
+    if (adaptiveRes.status === 'succeeded') {
+      action.status = 'completed';
+      action.result = adaptiveRes.finalResult;
+      return {
+        success: true,
+        result: action.result,
+        response: adaptiveRes.response,
+        targetScreen: adaptiveRes.targetScreen,
+        attempts: adaptiveRes.attempts,
+      };
+    } else {
+      action.status = 'failed';
+      action.error = { message: adaptiveRes.limitation || 'Action execution failed.' };
+      return {
+        success: false,
+        error: action.error,
+        response: adaptiveRes.response,
+        attempts: adaptiveRes.attempts,
+      };
+    }
+  }
+
   action.startedAt = Date.now();
   action.status = 'executing';
+
+  const singleAttempt: ExecutionAttempt = {
+    id: `att_${Date.now()}_1`,
+    attemptIndex: 1,
+    objective: action.description,
+    methodId: action.intent || action.capabilityId,
+    capabilityId: action.capabilityId,
+    methodName: action.description,
+    target: action.target,
+    parameters: action.parameters,
+    isPreferredMethod: true,
+    status: 'attempting',
+    startedAt: action.startedAt,
+    verified: false,
+  };
 
   try {
     // 1. Registered Capability Execution
@@ -536,17 +634,29 @@ export function executeActionNodeDirect(
         action.status = 'failed';
         action.error = { message: syncRes.response || 'Capability execution failed.' };
         action.completedAt = Date.now();
-        return { success: false, error: action.error, response: syncRes.response };
+        singleAttempt.status = 'failed';
+        singleAttempt.failureReason = action.error.message;
+        singleAttempt.completedAt = action.completedAt;
+        recordAttempt(singleAttempt);
+        action.attempts = [singleAttempt];
+        return { success: false, error: action.error, response: syncRes.response, attempts: action.attempts };
       }
 
       action.status = 'completed';
       action.result = syncRes?.metadata || syncRes;
       action.completedAt = Date.now();
+      singleAttempt.status = 'succeeded';
+      singleAttempt.verified = true;
+      singleAttempt.result = action.result;
+      singleAttempt.completedAt = action.completedAt;
+      recordAttempt(singleAttempt);
+      action.attempts = [singleAttempt];
       return {
         success: true,
         result: action.result,
         response: syncRes?.response,
         targetScreen: syncRes?.targetScreen,
+        attempts: action.attempts,
       };
     }
 
@@ -557,7 +667,11 @@ export function executeActionNodeDirect(
         action.status = 'failed';
         action.error = { message: 'Navigation context is not available.' };
         action.completedAt = Date.now();
-        return { success: false, error: action.error };
+        singleAttempt.status = 'failed';
+        singleAttempt.failureReason = action.error.message;
+        recordAttempt(singleAttempt);
+        action.attempts = [singleAttempt];
+        return { success: false, error: action.error, attempts: action.attempts };
       }
 
       const res = resolveInterfaceFromQuery(target, context.currentScreen);
@@ -568,18 +682,28 @@ export function executeActionNodeDirect(
         action.status = 'completed';
         action.result = { screen: res.match.route };
         action.completedAt = Date.now();
+        singleAttempt.status = 'succeeded';
+        singleAttempt.verified = true;
+        singleAttempt.result = action.result;
+        recordAttempt(singleAttempt);
+        action.attempts = [singleAttempt];
         return {
           success: true,
           result: action.result,
           response: `Opened **${res.match.name}**.`,
           targetScreen: res.match.route as ScreenId,
+          attempts: action.attempts,
         };
       }
 
       action.status = 'failed';
       action.error = { message: `Could not identify interface for "${target}".` };
       action.completedAt = Date.now();
-      return { success: false, error: action.error };
+      singleAttempt.status = 'failed';
+      singleAttempt.failureReason = action.error.message;
+      recordAttempt(singleAttempt);
+      action.attempts = [singleAttempt];
+      return { success: false, error: action.error, attempts: action.attempts };
     }
 
     // 3. Direct Math Calculation Execution
@@ -590,25 +714,43 @@ export function executeActionNodeDirect(
         action.status = 'completed';
         action.result = { calculation: calcResult };
         action.completedAt = Date.now();
-        return { success: true, result: action.result, response: calcResult };
+        singleAttempt.status = 'succeeded';
+        singleAttempt.verified = true;
+        singleAttempt.result = action.result;
+        recordAttempt(singleAttempt);
+        action.attempts = [singleAttempt];
+        return { success: true, result: action.result, response: calcResult, attempts: action.attempts };
       }
 
       action.status = 'failed';
       action.error = { message: `Could not calculate "${expr}".` };
       action.completedAt = Date.now();
-      return { success: false, error: action.error };
+      singleAttempt.status = 'failed';
+      singleAttempt.failureReason = action.error.message;
+      recordAttempt(singleAttempt);
+      action.attempts = [singleAttempt];
+      return { success: false, error: action.error, attempts: action.attempts };
     }
 
     // 4. Default Success
     action.status = 'completed';
     action.result = { description: action.description };
     action.completedAt = Date.now();
-    return { success: true, result: action.result };
+    singleAttempt.status = 'succeeded';
+    singleAttempt.verified = true;
+    singleAttempt.result = action.result;
+    recordAttempt(singleAttempt);
+    action.attempts = [singleAttempt];
+    return { success: true, result: action.result, attempts: action.attempts };
   } catch (err: any) {
     action.status = 'failed';
     action.error = { message: err?.message || String(err) };
     action.completedAt = Date.now();
-    return { success: false, error: action.error };
+    singleAttempt.status = 'failed';
+    singleAttempt.failureReason = action.error.message;
+    recordAttempt(singleAttempt);
+    action.attempts = [singleAttempt];
+    return { success: false, error: action.error, attempts: action.attempts };
   }
 }
 
@@ -652,16 +794,55 @@ export function executeActionPlanSync(
       };
     }
 
-    const execRes = executeActionNodeDirect(act, context);
-    if (execRes.success) {
+    const fallbackPolicy = act.fallbackPolicy || plan.adaptivePolicy || {
+      exclusivity: 'preferred',
+      maxAttempts: 3,
+      allowAutonomousFallback: true,
+    };
+
+    const preferredMethod = {
+      capabilityId: act.capabilityId,
+      methodId: act.intent || act.capabilityId,
+      methodName: act.description || act.capabilityId,
+      intent: act.intent,
+      target: act.target,
+      parameters: act.parameters,
+    };
+
+    const adaptiveRes = executeAdaptiveObjectiveSync(
+      plan.objective || act.description,
+      preferredMethod,
+      fallbackPolicy,
+      context
+    );
+
+    act.attempts = adaptiveRes.attempts;
+    plan.attempts = adaptiveRes.attempts;
+
+    if (adaptiveRes.status === 'succeeded') {
       completedIds.push(act.id);
-      results[act.id] = execRes.result;
+      results[act.id] = adaptiveRes.finalResult;
       plan.status = 'completed';
-      if (execRes.response) responses.push(execRes.response);
-      if (execRes.targetScreen) lastNavScreen = execRes.targetScreen;
+      if (adaptiveRes.targetScreen) lastNavScreen = adaptiveRes.targetScreen;
+    } else if (adaptiveRes.status === 'requires_confirmation') {
+      plan.status = 'waiting';
+      return {
+        planId: plan.id,
+        status: 'waiting',
+        executed: false,
+        summary: adaptiveRes.response,
+        results,
+        errors,
+        completedActionIds: completedIds,
+        failedActionIds: failedIds,
+        skippedActionIds: skippedIds,
+        plan,
+        actions: adaptiveRes.actions,
+        attempts: adaptiveRes.attempts,
+      };
     } else {
       failedIds.push(act.id);
-      errors[act.id] = execRes.error || { message: 'Action execution failed.' };
+      errors[act.id] = { message: adaptiveRes.limitation || 'Action execution failed.' };
       plan.status = 'failed';
     }
 
@@ -674,7 +855,7 @@ export function executeActionPlanSync(
       planId: plan.id,
       status: plan.status,
       executed: plan.status === 'completed',
-      summary: responses[0] || (plan.status === 'completed' ? 'Action completed.' : 'Action failed.'),
+      summary: adaptiveRes.response,
       results,
       errors,
       completedActionIds: completedIds,
@@ -682,6 +863,8 @@ export function executeActionPlanSync(
       skippedActionIds: skippedIds,
       plan,
       targetScreen: lastNavScreen,
+      attempts: adaptiveRes.attempts,
+      adapted: adaptiveRes.adapted,
     };
   }
 
@@ -936,6 +1119,57 @@ export function resolveActionPlanFromInput(
     if (last) {
       const retryPlan = createRetryPlan(last);
       if (retryPlan) return retryPlan;
+    }
+  }
+
+  // 1.5. User-Specified Fallback Policy: "try X, and if it fails, try Y"
+  const tryIfFailMatch = norm.match(/^try\s+(.+?)(?:,\s*|\s+)and\s+if\s+it\s+fails(?:,\s*|\s+)try\s+(.+)$/i);
+  if (tryIfFailMatch) {
+    const primaryText = tryIfFailMatch[1].trim();
+    const altText = tryIfFailMatch[2].trim();
+    const primaryAction = resolveSingleActionSegment(primaryText, 0);
+    const altAction = resolveSingleActionSegment(altText, 1);
+    const plan = createSingleActionPlan(primaryAction, defaultPolicy);
+    plan.adaptivePolicy = {
+      exclusivity: 'preferred',
+      maxAttempts: 2,
+      allowedMethods: [altAction.description, altAction.capabilityId, altAction.intent || ''],
+      allowAutonomousFallback: true,
+    };
+    plan.actions[0].fallbackPolicy = plan.adaptivePolicy;
+    return plan;
+  }
+
+  // 1.6. User-Specified Flexible Method: "use X first, but use another method if necessary" / "try whatever method works to X"
+  const flexibleMatch = norm.match(/^(?:use\s+(.+?)\s+first,\s*but\s+use\s+another\s+method\s+if\s+necessary|try\s+whatever\s+method\s+works\s+to\s+(.+))$/i);
+  if (flexibleMatch) {
+    const targetText = (flexibleMatch[1] || flexibleMatch[2]).trim();
+    const primaryAction = resolveSingleActionSegment(targetText, 0);
+    const plan = createSingleActionPlan(primaryAction, defaultPolicy);
+    plan.adaptivePolicy = {
+      exclusivity: 'preferred',
+      maxAttempts: 3,
+      allowAutonomousFallback: true,
+    };
+    plan.actions[0].fallbackPolicy = plan.adaptivePolicy;
+    return plan;
+  }
+
+  // 1.7. User-Specified Exclusive Method: "do this only using X", "only use X", "only with X"
+  const isExclusive = /\bonly\s+using\b|\bonly\s+with\b|\bonly\s+use\b|\buse\s+only\b|\bdo\s+this\s+only\b/i.test(norm);
+  if (isExclusive) {
+    const cleaned = norm.replace(/\bonly\s+using\b|\bonly\s+with\b|\bonly\s+use\b|\buse\s+only\b|\bdo\s+this\s+only\b/gi, '').trim();
+    const basePlan = resolveActionPlanFromInput(cleaned, currentScreen, defaultPolicy);
+    if (basePlan) {
+      basePlan.adaptivePolicy = {
+        exclusivity: 'exclusive',
+        maxAttempts: 1,
+        allowAutonomousFallback: false,
+      };
+      for (const a of basePlan.actions) {
+        a.fallbackPolicy = basePlan.adaptivePolicy;
+      }
+      return basePlan;
     }
   }
 
